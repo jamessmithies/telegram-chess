@@ -40,7 +40,10 @@ const CONFIG = {
   POLL_MINUTES: 5,              // How often to check for email replies
   MODEL: 'claude-haiku-4-5-20251001',  // Updated: haiku is sufficient for commentary and cheaper
   THREAD_LABEL: 'chess-game',   // Gmail label to track the game thread
-  AUTO_ARCHIVE: true,           // Automatically archive threads after moves
+  AUTO_ARCHIVE: 'smart',        // Options: false, true, 'smart' (archives only when waiting for player)
+  THREAD_SEARCH_DAYS: 30,       // How many days back to search for threads
+  MAX_PARSE_LINES: 50,          // Maximum lines to parse for moves
+  MAX_PARSE_LENGTH: 1000,       // Maximum characters to parse
   MAX_MOVE_LEN: 20,
   MAX_FEN_LEN: 200,
   MAX_COMMENT_LEN: 1500,
@@ -126,6 +129,88 @@ function isValidFen(fen) {
     return true;
   } catch (e) {
     return false;
+  }
+}
+// --- IMPROVED MESSAGE TRACKING ---
+// Uses message IDs instead of counts for reliable tracking
+function getLastProcessedMessageId() {
+  return PropertiesService.getScriptProperties()
+    .getProperty('CHESS_LAST_MESSAGE_ID') || '';
+}
+function setLastProcessedMessageId(messageId) {
+  PropertiesService.getScriptProperties()
+    .setProperty('CHESS_LAST_MESSAGE_ID', messageId);
+}
+// --- SMART THREAD DISCOVERY ---
+// Finds the game thread even if ID is lost
+function findGameThread() {
+  const state = getGameState();
+  let thread = null;
+  // Try 1: Use saved thread ID
+  if (state.threadId) {
+    try {
+      thread = GmailApp.getThreadById(state.threadId);
+      if (thread && thread.getMessageCount() > 0) {
+        Logger.log('Found thread by saved ID: ' + state.threadId);
+        return thread;
+      }
+    } catch (e) {
+      Logger.log('Saved thread ID invalid: ' + e.toString());
+    }
+  }
+  // Try 2: Search by game token and label
+  const token = getOrCreateGameToken();
+  const searchQueries = [
+    `label:${CONFIG.THREAD_LABEL} subject:"[chess:${token}]"`,
+    `subject:"[chess:${token}]" newer_than:${CONFIG.THREAD_SEARCH_DAYS}d`,
+    `label:${CONFIG.THREAD_LABEL} newer_than:7d`,
+  ];
+  for (const query of searchQueries) {
+    try {
+      const threads = GmailApp.search(query, 0, 5);
+      if (threads.length > 0) {
+        // Get the most recent thread
+        thread = threads.reduce((newest, current) =>
+          current.getLastMessageDate() > newest.getLastMessageDate() ? current : newest
+        );
+        // Update saved thread ID
+        state.threadId = thread.getId();
+        saveGameState(state);
+        Logger.log('Found thread by search: ' + query);
+        return thread;
+      }
+    } catch (e) {
+      Logger.log('Search failed: ' + query + ' - ' + e.toString());
+    }
+  }
+  Logger.log('No game thread found');
+  return null;
+}
+// --- SMART ARCHIVING HELPER ---
+function archiveIfAppropriate(thread, context) {
+  if (!thread) return;
+  Logger.log(`Archive check: mode=${CONFIG.AUTO_ARCHIVE}, context=${context}`);
+  if (CONFIG.AUTO_ARCHIVE === false) {
+    return; // Never archive
+  }
+  if (CONFIG.AUTO_ARCHIVE === true) {
+    thread.moveToArchive(); // Always archive
+    Logger.log('Archived (always mode)');
+    return;
+  }
+  if (CONFIG.AUTO_ARCHIVE === 'smart') {
+    // Smart mode: Archive only when waiting for player
+    const archiveContexts = [
+      'waiting_for_player',  // Engine has moved, waiting for player
+      'game_over',           // Game ended
+      'paused',             // Game is paused
+    ];
+    if (archiveContexts.includes(context)) {
+      thread.moveToArchive();
+      Logger.log(`Archived (smart mode: ${context})`);
+    } else {
+      Logger.log(`Not archiving (smart mode: ${context})`);
+    }
   }
 }
 // --- SHEET HELPERS ---
@@ -534,7 +619,8 @@ function processPlayerMove(moveStr) {
     return { error: 'Failed to process move. Please check your notation and try again.' };
   }
 }
-// --- EMAIL ---
+// --- IMPROVED EMAIL SENDING ---
+// Removes auto-archiving from sendGameEmail
 function sendGameEmail(subjectPrefix, body) {
   const state = getGameState();
   const subject = buildSubject(subjectPrefix);
@@ -542,37 +628,40 @@ function sendGameEmail(subjectPrefix, body) {
     const thread = GmailApp.getThreadById(state.threadId);
     if (thread) {
       thread.reply(body);
+      // Add label
       let label = GmailApp.getUserLabelByName(CONFIG.THREAD_LABEL);
       if (!label) label = GmailApp.createLabel(CONFIG.THREAD_LABEL);
       thread.addLabel(label);
-      if (CONFIG.AUTO_ARCHIVE) {
-        thread.moveToArchive();
-      }
-      state.lastProcessedCount = thread.getMessageCount();
-      saveGameState(state);
+      // Don't archive here - let checkForReplies handle it
+      Logger.log('Sent reply to existing thread');
       return;
     }
   }
+  // No thread - create new one
   GmailApp.sendEmail(getDestinationEmail(), subject, body);
   Utilities.sleep(2000);
+  // Find the new thread
   const token = getOrCreateGameToken();
-  const q = `from:me to:${getDestinationEmail()} subject:"[chess:${token}]" newer_than:7d`;
+  const q = `from:me to:${getDestinationEmail()} subject:"[chess:${token}]" newer_than:1d`;
   let threads = GmailApp.search(q, 0, 10);
   if (threads.length === 0) {
     Utilities.sleep(2000);
     threads = GmailApp.search(q, 0, 10);
   }
   if (threads.length > 0) {
-    let newest = threads[0];
-    for (const t of threads) {
-      if (t.getLastMessageDate() > newest.getLastMessageDate()) newest = t;
-    }
+    const newest = threads.reduce((latest, current) =>
+      current.getLastMessageDate() > latest.getLastMessageDate() ? current : latest,
+      threads[0]
+    );
     state.threadId = newest.getId();
-    state.lastProcessedCount = newest.getMessageCount();
+    // Add label
     let label = GmailApp.getUserLabelByName(CONFIG.THREAD_LABEL);
     if (!label) label = GmailApp.createLabel(CONFIG.THREAD_LABEL);
     newest.addLabel(label);
+    // Save the new thread ID
     saveGameState(state);
+    // Don't archive new threads
+    Logger.log('Created new thread: ' + state.threadId);
   }
 }
 function buildMoveEmail(engineResponse, commentary) {
@@ -606,135 +695,228 @@ function buildMoveEmail(engineResponse, commentary) {
   body += NOTATION_GUIDE;
   return safeTrim(body, 20000);
 }
-// --- REPLY PARSING ---
+// --- IMPROVED REPLY PARSING ---
+// More flexible parsing that handles various email formats
 function extractMoveFromReply(messageBody) {
-  const lines = String(messageBody || '').split('\n');
+  if (!messageBody) return null;
+  // Convert to string and handle different line endings
+  const text = String(messageBody)
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n');
+  // Extract the fresh content (before quotes/signatures)
+  const lines = text.split('\n');
   const freshLines = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i].trim();
-    if (line.startsWith('>')) break;
-    if (line.startsWith('On ') && line.includes(' wrote:')) break;
-    if (line === '--') break;
-    if (line.match(/^-{3,}$/)) break;
-    if (line.startsWith('From:')) break;
-    freshLines.push(line);
+  let totalChars = 0;
+  for (let i = 0; i < Math.min(lines.length, CONFIG.MAX_PARSE_LINES); i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+    // Stop at common quote/signature markers
+    if (trimmed.startsWith('>')) break;
+    if (trimmed.startsWith('On ') && line.includes(' wrote:')) break;
+    if (trimmed === '--') break;
+    if (trimmed.match(/^-{3,}$/)) break;
+    if (trimmed.match(/^_{3,}$/)) break;
+    if (trimmed.match(/^\*{3,}$/)) break;
+    if (trimmed.startsWith('From:')) break;
+    if (trimmed.startsWith('Sent from')) break;
+    freshLines.push(trimmed);
+    totalChars += trimmed.length;
+    if (totalChars > CONFIG.MAX_PARSE_LENGTH) break;
   }
   const freshText = freshLines.join(' ').trim();
   if (!freshText) return null;
-  // Skip automated emails sent by the script itself
-  if (freshText.startsWith('Engine plays:')) return null;
-  if (freshText.startsWith('Your move:')) return null;
-  if (freshText.startsWith('New game!')) return null;
-  if (freshText.startsWith('You resigned.')) return null;
-  if (freshText.startsWith('Game paused.')) return null;
-  if (freshText.startsWith('Game resumed!')) return null;
-  if (freshText.startsWith('It\'s your move!')) return null;
-  if (freshText.startsWith('No active game.')) return null;
-  if (freshText.startsWith('Illegal move:')) return null;
-  const firstToken = freshText.split(/\s+/)[0].toUpperCase();
-  if (firstToken === 'NEW') return { command: 'new' };
-  if (firstToken === 'RESIGN') return { command: 'resign' };
-  if (firstToken === 'PAUSE') return { command: 'pause' };
-  if (firstToken === 'CONTINUE') return { command: 'continue' };
-  // Note: regex is intentionally permissive — chess.js handles move validation downstream
-  const movePattern = /\b(O-O-O|O-O|[KQRBN]?[a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?[+#]?)\b/i;
-  const match = freshText.match(movePattern);
-  if (match) return { move: match[1] };
-  if (freshText.length <= 10 && /^[KQRBNPa-h0-9xO\-\+=#]+$/i.test(freshText)) {
-    return { move: freshText };
+  // Skip automated emails from the script itself
+  const skipPhrases = [
+    'Engine plays:', 'Your move:', 'New game!', 'You resigned.',
+    'Game paused.', 'Game resumed!', 'It\'s your move!',
+    'No active game.', 'Illegal move:', 'Game Over', 'Checkmate',
+    'Draw by', 'Stalemate'
+  ];
+  for (const phrase of skipPhrases) {
+    if (freshText.startsWith(phrase)) return null;
   }
+  // Check for commands (case insensitive, anywhere in fresh text)
+  const upperText = freshText.toUpperCase();
+  const firstWord = upperText.split(/\s+/)[0];
+  // Exact match for first word
+  if (firstWord === 'NEW') return { command: 'new' };
+  if (firstWord === 'RESIGN') return { command: 'resign' };
+  if (firstWord === 'PAUSE') return { command: 'pause' };
+  if (firstWord === 'CONTINUE') return { command: 'continue' };
+  // Also check if command appears clearly in the text
+  if (upperText.includes('START NEW GAME')) return { command: 'new' };
+  if (upperText.includes('I RESIGN')) return { command: 'resign' };
+  // Look for chess moves - try multiple patterns
+  const movePatterns = [
+    // Standard algebraic notation
+    /\b([KQRBN][a-h]?[1-8]?x?[a-h][1-8](?:=[QRBN])?[+#]?)\b/i,
+    // Pawn moves
+    /\b([a-h]x?[a-h]?[1-8](?:=[QRBN])?[+#]?)\b/i,
+    // Castling
+    /\b(O-O-O|O-O|0-0-0|0-0)\b/i,
+    // Simple destination (like "e4" or "d5")
+    /\b([a-h][1-8])\b/,
+  ];
+  // Try each pattern
+  for (const pattern of movePatterns) {
+    const matches = freshText.match(pattern);
+    if (matches) {
+      const move = matches[1].replace(/0/g, 'O'); // Convert zeros to O for castling
+      Logger.log('Found move: ' + move + ' using pattern: ' + pattern);
+      return { move: move };
+    }
+  }
+  // If the entire message is short and looks like a move, accept it
+  if (freshText.length <= 10) {
+    // Remove all spaces and check if it looks like a move
+    const compact = freshText.replace(/\s+/g, '');
+    if (/^[KQRBNPa-h0-9xO\-\+=#]+$/i.test(compact)) {
+      Logger.log('Accepting short text as move: ' + compact);
+      return { move: compact };
+    }
+  }
+  Logger.log('No move or command found in: ' + freshText.substring(0, 100));
   return null;
 }
-// --- POLL FOR REPLIES ---
+// --- IMPROVED POLL FOR REPLIES WITH SMART ARCHIVING ---
 function checkForReplies() {
   return withScriptLock(() => {
     const state = getGameState();
-    if (!state.threadId) return;
-    const thread = GmailApp.getThreadById(state.threadId);
-    if (!thread) return;
+    const thread = findGameThread();
+    if (!thread) {
+      Logger.log('No active game thread found');
+      return;
+    }
+    // Smart archiving: Move to inbox while processing
+    if (CONFIG.AUTO_ARCHIVE === 'smart') {
+      thread.moveToInbox();
+      Logger.log('Moved thread to inbox for processing');
+    }
     const messages = thread.getMessages();
-    const startIdx = Math.max(0, state.lastProcessedCount);
-    if (messages.length <= startIdx) return;
-    for (let i = startIdx; i < messages.length; i++) {
+    const lastProcessedId = getLastProcessedMessageId();
+    Logger.log(`Thread has ${messages.length} messages. Last processed: ${lastProcessedId}`);
+    // Find where we left off
+    let startIndex = 0;
+    if (lastProcessedId) {
+      for (let i = 0; i < messages.length; i++) {
+        if (messages[i].getId() === lastProcessedId) {
+          startIndex = i + 1;
+          break;
+        }
+      }
+    }
+    Logger.log(`Starting processing from message index ${startIndex}`);
+    // Track if we processed anything
+    let processedAny = false;
+    let lastMessageId = lastProcessedId;
+    // Process new messages
+    for (let i = startIndex; i < messages.length; i++) {
       const msg = messages[i];
+      const msgId = msg.getId();
+      Logger.log(`Processing message ${i}: From ${msg.getFrom()}`);
+      // Skip messages not from the player
       if (!onlyMeGuard(msg)) {
-        Logger.log('Rejected reply from unauthorized sender: ' + msg.getFrom());
+        Logger.log('Skipping - not from authorized sender');
+        lastMessageId = msgId;
         continue;
       }
+      // Try to extract move or command
       const parsed = extractMoveFromReply(msg.getPlainBody());
-      if (!parsed) continue;
-      state.lastProcessedCount = i + 1;
-      saveGameState(state);
+      if (!parsed) {
+        Logger.log('No move/command found in message');
+        lastMessageId = msgId;
+        continue;
+      }
+      // We found something to process
+      processedAny = true;
+      lastMessageId = msgId;
+      // Save progress before processing (in case of errors)
+      setLastProcessedMessageId(msgId);
+      // Handle commands
       if (parsed.command === 'new') {
+        Logger.log('Processing NEW command');
         startNewGameInternal_();
         return;
       }
       if (parsed.command === 'resign') {
+        Logger.log('Processing RESIGN command');
         state.gameActive = false;
         saveGameState(state);
         sendGameEmail(
           '♟ Chess',
           'You resigned. Good game!\n\n' +
-            'Move history: ' +
-            state.moveHistory +
-            '\n\nReply NEW to start a new game.'
+          'Move history: ' + state.moveHistory +
+          '\n\nReply NEW to start a new game.'
         );
+        archiveIfAppropriate(thread, 'game_over');
         return;
       }
       if (parsed.command === 'pause') {
+        Logger.log('Processing PAUSE command');
         state.paused = true;
         saveGameState(state);
-        sendGameEmail('♟ Chess', 'Game paused. No daily emails until you resume.\n\nReply CONTINUE to resume.');
+        sendGameEmail('♟ Chess', 'Game paused. Reply CONTINUE to resume.');
+        archiveIfAppropriate(thread, 'paused');
         return;
       }
       if (parsed.command === 'continue') {
+        Logger.log('Processing CONTINUE command');
         state.paused = false;
         saveGameState(state);
         sendGameEmail(
           '♟ Chess',
           'Game resumed!\n\n' +
-            'Move history: ' +
-            state.moveHistory +
-            '\n\nReply with your move.'
+          'Move history: ' + state.moveHistory +
+          '\n\nReply with your move.'
         );
+        // Don't archive - waiting for player move
         return;
       }
+      // Check if game is paused
       if (state.paused) {
-        sendGameEmail('♟ Chess', 'Game is paused. Reply CONTINUE to resume, or NEW to start a fresh game.');
+        sendGameEmail('♟ Chess', 'Game is paused. Reply CONTINUE to resume.');
+        archiveIfAppropriate(thread, 'paused');
         return;
       }
+      // Process move
       if (parsed.move) {
-        if (CONFIG.AUTO_ARCHIVE) {
-          thread.moveToArchive();
-        }
+        Logger.log('Processing move: ' + parsed.move);
         const result = processPlayerMove(parsed.move);
         if (result.error) {
+          Logger.log('Move error: ' + result.error);
           const cur = getGameState();
           sendGameEmail(
             '♟ Chess',
             result.error +
-              '\n\nMove history: ' + cur.moveHistory +
-              '\n\nTry again — reply with a valid move.'
+            '\n\nMove history: ' + cur.moveHistory +
+            '\n\nReply with a valid move.'
           );
-          if (CONFIG.AUTO_ARCHIVE && thread) {
-            thread.moveToArchive();
-          }
+          // Don't archive on error - keep visible for correction
           return;
         }
+        Logger.log('Player move accepted: ' + result.move);
+        // Get engine response
         const engineResult = getEngineMove();
         if (engineResult) {
           const commentary = getCommentary(result.move, engineResult.move, getGameState());
           const emailBody = 'Your move: ' + result.move + '\n\n' + buildMoveEmail(engineResult, commentary);
           sendGameEmail('♟ Chess', emailBody);
-          if (CONFIG.AUTO_ARCHIVE && thread) {
-            thread.moveToArchive();
-          }
+          // Smart archive: Archive because we're now waiting for player
+          archiveIfAppropriate(thread, 'waiting_for_player');
         }
         return;
       }
     }
-    state.lastProcessedCount = messages.length;
-    saveGameState(state);
+    // Update last processed ID if we went through messages
+    if (lastMessageId !== lastProcessedId) {
+      setLastProcessedMessageId(lastMessageId);
+    }
+    // If we didn't process anything and using smart archive,
+    // move back to archive since we're still waiting
+    if (!processedAny && CONFIG.AUTO_ARCHIVE === 'smart') {
+      thread.moveToArchive();
+      Logger.log('No new moves found - moved thread back to archive');
+    }
   });
 }
 // --- NEW GAME ---
@@ -804,4 +986,71 @@ function quickStart() {
   Logger.log('✅ Setup complete! Check your inbox for the first chess email.');
   Logger.log('📧 The thread will be labeled "chess-game" and auto-archived after moves.');
   Logger.log('♟️  Reply with your move to play!');
+}
+// --- MIGRATION & DEBUG HELPERS ---
+// Run this once to migrate from count-based to ID-based tracking
+function migrateToMessageIdTracking() {
+  const state = getGameState();
+  const thread = findGameThread();
+  if (!thread) {
+    Logger.log('No thread to migrate');
+    return;
+  }
+  const messages = thread.getMessages();
+  const lastProcessedCount = state.lastProcessedCount || 0;
+  if (lastProcessedCount > 0 && lastProcessedCount <= messages.length) {
+    const lastMessage = messages[lastProcessedCount - 1];
+    setLastProcessedMessageId(lastMessage.getId());
+    Logger.log(`Migrated: Set last processed message ID from count ${lastProcessedCount}`);
+  } else {
+    Logger.log('No migration needed');
+  }
+}
+// Check the current game state
+function debugGameState() {
+  const state = getGameState();
+  const thread = findGameThread();
+  const lastMsgId = getLastProcessedMessageId();
+  Logger.log('=== GAME STATE DEBUG ===');
+  Logger.log('Active: ' + state.gameActive);
+  Logger.log('Paused: ' + state.paused);
+  Logger.log('Thread ID: ' + state.threadId);
+  Logger.log('Found thread: ' + (thread ? 'Yes' : 'No'));
+  Logger.log('Message count: ' + (thread ? thread.getMessageCount() : 'N/A'));
+  Logger.log('Last processed ID: ' + lastMsgId);
+  Logger.log('Move history: ' + state.moveHistory);
+  Logger.log('Current FEN: ' + state.fen);
+  Logger.log('Archive mode: ' + CONFIG.AUTO_ARCHIVE);
+}
+// Manually check for replies
+function manualCheckReplies() {
+  Logger.log('=== MANUAL REPLY CHECK ===');
+  checkForReplies();
+}
+// Reset tracking (use if things get stuck)
+function resetMessageTracking() {
+  PropertiesService.getScriptProperties().deleteProperty('CHESS_LAST_MESSAGE_ID');
+  Logger.log('Reset message tracking - will reprocess all messages in thread');
+}
+// Test move extraction
+function testMoveExtraction() {
+  const testCases = [
+    'e4',
+    'Nf3',
+    'O-O',
+    '0-0-0',
+    'Qxd5+',
+    'e4\n\nSent from my iPhone',
+    '> On date, person wrote:\n> previous message\n\ne4',
+    'I\'ll play e4',
+    'My move is Nf3',
+    'NEW',
+    'resign',
+    'Here is my move: Bc4',
+  ];
+  Logger.log('=== MOVE EXTRACTION TESTS ===');
+  for (const test of testCases) {
+    const result = extractMoveFromReply(test);
+    Logger.log(`"${test.substring(0, 30)}..." => ${JSON.stringify(result)}`);
+  }
 }
