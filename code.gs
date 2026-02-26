@@ -729,7 +729,7 @@ function extractMoveFromReply(messageBody) {
   const skipPhrases = [
     'Engine plays:', 'Your move:', 'New game!', 'You resigned.',
     'Game paused.', 'Game resumed!', 'It\'s your move!',
-    'No active game.', 'Illegal move:', 'Game Over', 'Checkmate',
+    'No active game.', 'Illegal move', 'Game Over', 'Checkmate',
     'Draw by', 'Stalemate'
   ];
   for (const phrase of skipPhrases) {
