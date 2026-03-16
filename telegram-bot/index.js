@@ -221,6 +221,7 @@ async function getCommentary(playerMove, engineMove, state) {
       advanced: 'The player is advanced. Give concise analytical commentary.',
     };
     const systemPrompt = `You are a chess tutor. Comment briefly (1-2 sentences) on the engine's move to help the player learn. Do NOT suggest moves for the player. Respond with plain text only, no JSON or markdown.
+When a move gives check (+), use the FEN to identify which piece actually attacks the king. A move like Nd3+ may be a discovered check (the knight unmasked a rook or bishop that now attacks the king) rather than a direct knight check. Always attribute the check to the correct attacking piece.
 Style: ${difficultyInstructions[state.difficulty] || difficultyInstructions.intermediate}`;
     const userMessage = `Position: ${state.fen}\nHistory: ${state.moveHistory || '(start)'}\nPlayer played: ${playerMove}\nEngine replied: ${engineMove}`;
 
