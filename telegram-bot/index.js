@@ -212,18 +212,28 @@ async function callStockfish(fen, difficulty) {
 
 // --- CLAUDE COMMENTARY ---
 
-async function getCommentary(playerMove, engineMove, state) {
+async function getCommentary(playerMove, engineMove, state, evaluation) {
   if (!CONFIG.ANTHROPIC_API_KEY) return '';
   try {
     const difficultyInstructions = {
-      beginner: 'The player is a beginner. Explain in plain language. Keep it encouraging.',
-      intermediate: 'The player is intermediate. Give a brief positional or tactical comment.',
-      advanced: 'The player is advanced. Give concise analytical commentary.',
+      beginner: 'The player is a beginner. Explain what the engine is trying to do in plain, jargon-free language. If the player made a mistake, gently explain what went wrong and what to watch out for.',
+      intermediate: 'The player is intermediate. Explain the strategic or tactical idea behind the engine\'s move — what threat it creates, what weakness it targets, or what positional advantage it gains. If the player\'s move was inaccurate, briefly explain why.',
+      advanced: 'The player is advanced. Give concise analytical commentary on the engine\'s plan and any inaccuracies in the player\'s move. Reference concrete variations or positional concepts where relevant.',
     };
-    const systemPrompt = `You are a chess tutor. Comment briefly (1-2 sentences) on the engine's move to help the player learn. Do NOT suggest moves for the player. Respond with plain text only, no JSON or markdown.
-When a move gives check (+), use the FEN to identify which piece actually attacks the king. A move like Nd3+ may be a discovered check (the knight unmasked a rook or bishop that now attacks the king) rather than a direct knight check. Always attribute the check to the correct attacking piece.
-Style: ${difficultyInstructions[state.difficulty] || difficultyInstructions.intermediate}`;
-    const userMessage = `Position: ${state.fen}\nHistory: ${state.moveHistory || '(start)'}\nPlayer played: ${playerMove}\nEngine replied: ${engineMove}`;
+    const systemPrompt = `You are a chess coach providing commentary on an ongoing game. The player is playing against a chess engine and wants to improve. Your job is to help them understand the position, not to tell them what to play next.
+
+For each pair of moves, comment in 2-3 sentences:
+1. Briefly assess the player's move — was it solid, inaccurate, or did it miss something? If the evaluation shifted significantly against them, explain why.
+2. Explain the ENGINE's move — what is its strategic or tactical purpose? What threat does it create, what does it defend, or what positional idea does it serve?
+
+Rules:
+- Do NOT suggest or hint at the player's next move. Never say "you should consider" or "you might want to play".
+- When a move gives check (+), use the FEN to identify which piece actually attacks the king. A move like Nd3+ may be a discovered check (the knight unmasked a rook or bishop) rather than a direct check from the moving piece. Always attribute the check to the correct attacking piece.
+- Respond with plain text only, no JSON or markdown.
+
+${difficultyInstructions[state.difficulty] || difficultyInstructions.intermediate}`;
+    const evalText = evaluation ? formatEvaluation(evaluation) : 'unavailable';
+    const userMessage = `Position (after both moves): ${state.fen}\nMove history: ${state.moveHistory || '(start)'}\nPlayer (${state.playerColour}) played: ${playerMove}\nEngine replied: ${engineMove}\nEvaluation after engine move: ${evalText}`;
 
     const resp = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -409,7 +419,7 @@ async function processMove(chatId, moveStr, state) {
   await saveState(chatId, state);
 
   // Get commentary (non-blocking — game state already saved)
-  const commentary = await getCommentary(playerSan, engineSan, state);
+  const commentary = await getCommentary(playerSan, engineSan, state, engineResult.evaluation);
 
   // Build response (escape dynamic text for HTML safety)
   const evalText = formatEvaluation(engineResult.evaluation);
