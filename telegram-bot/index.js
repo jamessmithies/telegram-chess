@@ -229,6 +229,8 @@ For each pair of moves, comment in 2-3 sentences:
 Rules:
 - Do NOT suggest or hint at the player's next move. Never say "you should consider" or "you might want to play".
 - When a move gives check (+), use the FEN to identify which piece actually attacks the king. A move like Nd3+ may be a discovered check (the knight unmasked a rook or bishop) rather than a direct check from the moving piece. Always attribute the check to the correct attacking piece.
+- Before describing any piece on a specific square, verify it is actually there in the provided FEN. Do not reference a piece on a square if the FEN shows it absent.
+- Comment only on what the two moves in this pair achieve. Do not describe earlier moves in the game as consequences or preparations of the current move — the move history is context only, not something to re-explain.
 - Respond with plain text only, no JSON or markdown.
 
 ${difficultyInstructions[state.difficulty] || difficultyInstructions.intermediate}`;
